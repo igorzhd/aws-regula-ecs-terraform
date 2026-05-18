@@ -1,0 +1,116 @@
+# ============================================================
+# Python API — requirements.txt
+# Install everything with: pip install -r requirements.txt
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Web Framework
+# FastAPI is the web framework that handles incoming HTTP
+# requests and routes them to the right function. It is
+# modern, fast, and automatically generates interactive API
+# documentation at /docs — very useful during development.
+# Uvicorn is the web server that actually runs FastAPI.
+# The [standard] extra adds websocket support and a faster
+# event loop (uvloop) automatically.
+# ------------------------------------------------------------
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+
+# ------------------------------------------------------------
+# HTTP Client
+# httpx is used to make HTTP requests FROM this API to the
+# Regula container. We use httpx instead of the more common
+# "requests" library because FastAPI is async (non-blocking)
+# and "requests" is blocking — it would freeze the server
+# while waiting for Regula to respond. httpx has a native
+# async client that works correctly with FastAPI.
+# ------------------------------------------------------------
+httpx==0.27.2
+
+
+# ------------------------------------------------------------
+# Database — SQLAlchemy + asyncpg + Alembic
+#
+# SQLAlchemy is the main database toolkit. It lets you define
+# tables as Python classes and query them using Python instead
+# of raw SQL. Version 2.0 has full async support.
+#
+# asyncpg is the low-level async PostgreSQL driver that
+# SQLAlchemy uses under the hood to actually talk to the
+# database. It is required when running SQLAlchemy in async
+# mode with FastAPI.
+#
+# Alembic is the database migration tool. When you change your
+# table structure (add a column, rename a field, etc.), Alembic
+# generates and applies those changes safely without data loss.
+# Think of it as Git for your database schema.
+# ------------------------------------------------------------
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+
+
+# ------------------------------------------------------------
+# Data Validation — Pydantic + pydantic-settings
+#
+# Pydantic validates all data coming into and going out of the
+# API. If the frontend sends a request with the wrong format,
+# Pydantic catches it before it reaches your code and returns
+# a clear error message automatically.
+#
+# pydantic-settings extends Pydantic to handle configuration:
+# it reads environment variables and .env files and validates
+# them the same way, used in config.py.
+# ------------------------------------------------------------
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+
+# ------------------------------------------------------------
+# File Storage — boto3
+# boto3 is the official Amazon Web Services SDK for Python.
+# It is used in storage.py to upload files (document crop
+# images and raw JSON) to S3 and to generate presigned URLs
+# (temporary download links) for the frontend.
+# In local development mode, storage.py saves to disk instead
+# and boto3 is not actively used.
+# ------------------------------------------------------------
+boto3==1.35.28
+
+
+# ------------------------------------------------------------
+# File Uploads — python-multipart
+# FastAPI requires this package to handle multipart/form-data
+# requests — which is the format browsers use when uploading
+# files. Without this, the POST /process endpoint that receives
+# document images will not work at all.
+# ------------------------------------------------------------
+python-multipart==0.0.12
+
+
+# ------------------------------------------------------------
+# Environment Variables — python-dotenv
+# Loads variables from a .env file in the project root into
+# the environment when running locally. In production on AWS,
+# environment variables are injected by ECS directly and this
+# package is not needed, but it does not hurt to have it.
+# ------------------------------------------------------------
+python-dotenv==1.0.1
+
+
+# ------------------------------------------------------------
+# Utilities
+#
+# Pillow is the standard Python image processing library.
+# Used to decode base64 images from Regula, convert formats
+# if needed, and validate that document crops are valid images
+# before saving them to storage.
+#
+# aiofiles enables async file I/O — reading and writing files
+# without blocking the server. Used in local storage mode when
+# saving files to disk instead of S3.
+# ------------------------------------------------------------
+Pillow==10.4.0
+aiofiles==24.1.0

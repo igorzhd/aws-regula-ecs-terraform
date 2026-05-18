@@ -1,0 +1,232 @@
+# ============================================================
+# docker-compose.yml — Local Development Stack
+#
+# This file defines the three services that make up the
+# complete local development environment. Run all three
+# with one command from the services/python-api/ folder:
+#
+#   docker compose up
+#
+# Or to run in the background (detached mode):
+#   docker compose up -d
+#
+# To stop everything:
+#   docker compose down
+#
+# To stop and delete the database volume (fresh start):
+#   docker compose down -v
+#
+# To see logs from all services:
+#   docker compose logs -f
+#
+# To see logs from one service only:
+#   docker compose logs -f python-api
+#
+# SERVICES:
+#   postgres    — PostgreSQL database (replaces AWS RDS locally)
+#   regula      — Regula Document Reader (same as production)
+#   python-api  — Our FastAPI application
+#
+# NETWORK:
+#   All three services are on the same Docker network called
+#   "docverify-network". They can reach each other by service
+#   name (e.g. the API reaches Regula at http://regula:8080
+#   and the database at postgres:5432).
+#
+# PORTS (host:container):
+#   5432:5432  — PostgreSQL (for connecting with a DB client)
+#   8080:8080  — Regula (for testing directly in browser)
+#   8001:8001  — Python API (your main development endpoint)
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL Database
+  # Replaces AWS RDS during local development.
+  # Uses the official PostgreSQL 16 image.
+  #
+  # Data is stored in a Docker volume called "postgres-data"
+  # so it persists between container restarts. If you want
+  # a completely fresh database, run: docker compose down -v
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    # alpine = smaller Alpine Linux base, faster to download
+
+    container_name: docverify-postgres
+
+    environment:
+      # These match the DATABASE_URL in your .env file:
+      # postgresql+asyncpg://postgres:postgres@postgres:5432/docverify
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: docverify
+
+    ports:
+      # Expose PostgreSQL to your host machine so you can
+      # connect with tools like DBeaver, TablePlus, or psql
+      - "5432:5432"
+
+    volumes:
+      # Named volume: data persists between container restarts
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      # Check that PostgreSQL is accepting connections.
+      # Other services use "depends_on condition: healthy"
+      # to wait for this before starting.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d docverify"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - docverify-network
+
+    restart: unless-stopped
+    # unless-stopped: restart automatically if the container
+    # crashes, but NOT if you manually stop it with
+    # docker compose stop
+
+
+  # ----------------------------------------------------------
+  # Regula Document Reader
+  # The document processing engine. Identical to production —
+  # this is the same Docker image that runs on ECS.
+  #
+  # Requires the regula.license file to be present in the
+  # same folder as this docker-compose.yml.
+  # ----------------------------------------------------------
+  regula:
+    image: regulaforensics/docreader:latest
+
+    container_name: docverify-regula
+
+    ports:
+      # Expose Regula's web interface and API
+      # Visit http://localhost:8080 to see Regula's built-in UI
+      - "8080:8080"
+
+    # Decode the base64 license from env into a file, then run normally.
+    # The actual value lives in .env (gitignored) locally and in
+    # Secrets Manager in production — never hardcoded here.
+    entrypoint: ["/bin/sh", "-c", "echo \"$REGULA_LICENSE_B64\" | base64 -d > /app/extBin/unix/regula.license && exec /app/entrypoint.sh"]
+
+    environment:
+      REGULA_LICENSE_B64: "${REGULA_LICENSE_B64}"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/ping || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+      # Regula takes ~15 seconds to initialize, so we give it
+      # 30 seconds before health checks start
+
+    networks:
+      - docverify-network
+
+    restart: unless-stopped
+
+
+  # ----------------------------------------------------------
+  # Python API (our application)
+  # Built from the Dockerfile in the current directory.
+  #
+  # IMPORTANT: This service depends on both postgres and
+  # regula being healthy before it starts. Docker will wait
+  # for their healthchecks to pass before starting this.
+  # ----------------------------------------------------------
+  python-api:
+    # Build from the Dockerfile in the current directory
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: docverify-api
+
+    ports:
+      # The API is available at http://localhost:8001
+      # API docs are at http://localhost:8001/docs
+      - "8001:8001"
+
+    environment:
+      # These override anything in the .env file.
+      # Note: inside Docker, services reach each other by
+      # service name, not localhost. So Regula is at
+      # http://regula:8080 (not http://localhost:8080)
+      # and PostgreSQL is at postgres:5432.
+
+      # Regula — use Docker service name, not localhost
+      REGULA_URL: http://regula:8080
+      REGULA_PROCESS_PATH: /api/process
+      REGULA_TIMEOUT_SECONDS: "60"
+      REGULA_SCENARIO: FullProcess
+
+      # Database — use Docker service name, not localhost
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/docverify
+      DATABASE_POOL_SIZE: "5"
+      DATABASE_MAX_OVERFLOW: "10"
+
+      # Storage — local disk inside the container
+      STORAGE_MODE: local
+      LOCAL_STORAGE_PATH: /app/local_storage
+
+      # API settings
+      API_PORT: "8001"
+      APP_TITLE: Document Verification API
+      APP_VERSION: "0.1.0"
+      LOG_LEVEL: DEBUG
+
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--log-level", "debug"]
+
+    volumes:
+      # Mount the app code into the container.
+      # Code changes on your host are immediately reflected
+      # inside the container. The --reload flag in the command
+      # above auto-restarts the server when you save a file.
+      - .:/app
+
+      # Mount the local_storage folder so saved files are
+      # accessible on your host machine at:
+      # services/python-api/local_storage/
+      - ./local_storage:/app/local_storage
+
+    depends_on:
+      # Wait for PostgreSQL to be healthy before starting
+      postgres:
+        condition: service_healthy
+      # Wait for Regula to be healthy before starting
+      regula:
+        condition: service_healthy
+
+    networks:
+      - docverify-network
+
+    restart: unless-stopped
+
+
+# ============================================================
+# VOLUMES
+# Named volumes are managed by Docker and persist between
+# container restarts. They live outside the container
+# filesystem so data survives "docker compose down".
+# "docker compose down -v" deletes them (fresh start).
+# ============================================================
+volumes:
+  postgres-data:
+    driver: local
+
+
+# ============================================================
+# NETWORKS
+# A private network that all services share. Services can
+# reach each other by name (postgres, regula, python-api)
+# but are isolated from other Docker networks on your machine.
+# ============================================================
+networks:
+  docverify-network:
+    driver: bridge

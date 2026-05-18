@@ -1,0 +1,407 @@
+# =============================================================================
+# APPLY WORKFLOW — Deploy the plan created by the Plan workflow.
+# =============================================================================
+#
+# PREREQUISITES:
+#   1. Run the Plan workflow first and review its output
+#   2. Copy the Plan workflow's Run ID (number in the URL, e.g. 12345678)
+#   3. Trigger this workflow and paste that Run ID in the input field
+#
+# WHAT THIS DOES (in order):
+#   1. terraform-apply  — Download saved plan, apply it to AWS
+#   2. ecs-redeploy     — (optional) Force ECS to pull the latest ECR image
+#   3. deploy-frontend  — Sync HTML/CSS/JS to S3, invalidate CloudFront cache
+#   4. health-check     — Verify ALB targets are healthy
+#   5. summary          — Print full deployment result (always runs)
+#
+# STALE PLAN ERROR:
+#   If you see "Saved plan is stale", it means the Terraform state changed
+#   after the plan was created (e.g. a previous apply partially succeeded).
+#   Fix: re-run the Plan workflow to get a fresh plan, then apply that.
+#
+# REQUIRED GITHUB SECRETS (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID     — IAM user access key
+#   AWS_SECRET_ACCESS_KEY — IAM user secret key
+# =============================================================================
+
+name: "Apply"
+
+# actions: read  — required to download artifacts from a different workflow run
+# contents: read — required to checkout the repository
+permissions:
+  actions: read
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_run_id:
+        description: "Run ID from the Plan workflow — copy from the plan run's URL (e.g. 12345678)"
+        required: true
+        type: string
+      redeploy_ecs:
+        description: "Redeploy ECS containers? Check only if you pushed a new image to ECR."
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Why are you deploying? (for audit log)"
+        required: false
+        default: "Manual deploy"
+        type: string
+
+# Prevent two applies from running simultaneously — they would corrupt TF state.
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false   # Do NOT cancel in-progress apply — let it finish.
+
+env:
+  AWS_REGION:      us-west-2
+  TF_DIR:          terraform/environments/dev
+  FRONTEND_DIR:    services/frontend
+  ECS_CLUSTER:     regula-ecs-lab-dev-ecs-cluster
+  ECS_SERVICE:     regula-ecs-lab-dev-ecs-service
+  ECS_TASK_FAMILY: regula-ecs-lab-dev-task-def
+
+jobs:
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 1 · TERRAFORM APPLY                                                 │
+  # │                                                                         │
+  # │ Downloads the saved plan artifact from the Plan workflow run and        │
+  # │ applies it. Using the saved binary plan file guarantees that exactly    │
+  # │ what you reviewed in the Plan workflow gets deployed — not a freshly   │
+  # │ computed plan that may differ if the code changed in between.          │
+  # │                                                                         │
+  # │ STALE PLAN:                                                             │
+  # │   Error "Saved plan is stale" means state changed after the plan was   │
+  # │   created. This happens when a previous apply partially succeeded.     │
+  # │   Solution: re-run the Plan workflow, then apply the new plan.         │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  terraform-apply:
+    name: "1 · Terraform Apply"
+    runs-on: ubuntu-latest
+
+    outputs:
+      cloudfront_id: ${{ steps.tf_outputs.outputs.cloudfront_id }}
+      s3_bucket:     ${{ steps.tf_outputs.outputs.s3_bucket }}
+
+    steps:
+      - name: "Print deploy context"
+        run: |
+          echo "============================================================"
+          echo "  APPLY STARTING"
+          echo "============================================================"
+          echo "  Plan Run ID: ${{ inputs.plan_run_id }}"
+          echo "  Reason:      ${{ inputs.reason }}"
+          echo "  Actor:       ${{ github.actor }}"
+          echo "  Commit:      ${{ github.sha }}"
+          echo "  Redeploy ECS: ${{ inputs.redeploy_ecs }}"
+          echo "============================================================"
+
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Install Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.14"
+          terraform_wrapper: false
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      # Download the binary plan file saved by the Plan workflow.
+      # The artifact is named tfplan-<run_id> — we reconstruct that name
+      # from the plan_run_id input the user pasted when triggering this workflow.
+      - name: "Download Terraform plan artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.plan_run_id }}
+          path: ${{ env.TF_DIR }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.plan_run_id }}
+
+      - name: "Terraform apply"
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          echo "Applying plan from run ${{ inputs.plan_run_id }}..."
+          terraform apply -input=false tfplan
+          echo "Apply complete."
+
+      - name: "Read Terraform outputs"
+        id: tf_outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id)
+          S3_BUCKET=$(terraform output -raw s3_frontend_bucket_name)
+
+          echo "cloudfront_id=${CLOUDFRONT_ID}" >> $GITHUB_OUTPUT
+          echo "s3_bucket=${S3_BUCKET}"         >> $GITHUB_OUTPUT
+
+          echo "CloudFront Distribution ID: ${CLOUDFRONT_ID}"
+          echo "S3 Frontend Bucket:         ${S3_BUCKET}"
+
+      - name: "Write apply summary"
+        run: |
+          {
+            echo "## 1 · Terraform Apply"
+            echo "✅ Infrastructure applied successfully"
+            echo ""
+            echo "| Resource | Value |"
+            echo "|----------|-------|"
+            echo "| CloudFront ID | \`${{ steps.tf_outputs.outputs.cloudfront_id }}\` |"
+            echo "| S3 Bucket     | \`${{ steps.tf_outputs.outputs.s3_bucket }}\` |"
+            echo "| Plan Run ID   | \`${{ inputs.plan_run_id }}\` |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 2 · FORCE ECS REDEPLOY (conditional)                                │
+  # │                                                                         │
+  # │ Only runs when "Redeploy ECS containers?" is checked.                  │
+  # │ Use this when you have pushed a new Python API image to ECR.           │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  force-ecs-redeploy:
+    name: "2 · Deploy to ECS"
+    runs-on: ubuntu-latest
+    needs: [terraform-apply]
+    if: ${{ inputs.redeploy_ecs == true }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Show current ECS service state"
+        run: |
+          echo "ECS service state BEFORE deployment:"
+          aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,TaskDef:taskDefinition}' \
+            --output yaml
+
+      - name: "Force new ECS deployment"
+        run: |
+          echo "Forcing new ECS deployment..."
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service  "${{ env.ECS_SERVICE }}" \
+            --force-new-deployment
+          echo "Rolling deployment initiated."
+
+      # Blocks until all tasks are RUNNING and passing ALB health checks.
+      # Default timeout ~10 minutes. If exceeded, check CloudWatch logs.
+      - name: "Wait for ECS service to stabilize"
+        run: |
+          echo "Waiting for ECS service steady state (usually 2-5 minutes)..."
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service  "${{ env.ECS_SERVICE }}"
+          echo "ECS service is stable."
+
+      - name: "Show ECS service state after deployment"
+        run: |
+          echo "ECS service state AFTER deployment:"
+          aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount,Deployments:deployments[*].{Status:status,Running:runningCount,Desired:desiredCount}}' \
+            --output yaml
+
+      - name: "Write ECS summary"
+        run: |
+          {
+            echo "## 2 · ECS Deployment"
+            echo "✅ ECS service redeployed and stable"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Cluster | \`${{ env.ECS_CLUSTER }}\` |"
+            echo "| Service | \`${{ env.ECS_SERVICE }}\` |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 3 · DEPLOY FRONTEND                                                 │
+  # │                                                                         │
+  # │ Runs in parallel with Job 2 — both depend on Job 1 but not each other. │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  deploy-frontend:
+    name: "3 · Deploy Frontend"
+    runs-on: ubuntu-latest
+    needs: [terraform-apply]
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Sync frontend files to S3"
+        run: |
+          echo "Syncing to s3://${{ needs.terraform-apply.outputs.s3_bucket }}/"
+          aws s3 sync \
+            "${{ env.FRONTEND_DIR }}" \
+            "s3://${{ needs.terraform-apply.outputs.s3_bucket }}/" \
+            --delete \
+            --exact-timestamps
+          echo "Sync complete."
+
+      # Forces CloudFront edge servers to fetch fresh files from S3.
+      # Without this, users see the old cached version for up to 24 hours.
+      - name: "Invalidate CloudFront cache"
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ needs.terraform-apply.outputs.cloudfront_id }}" \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "Invalidation created: ${INVALIDATION_ID}"
+
+      - name: "Write frontend summary"
+        run: |
+          {
+            echo "## 3 · Frontend Deployment"
+            echo "✅ Frontend deployed and cache invalidated"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| S3 Bucket     | \`${{ needs.terraform-apply.outputs.s3_bucket }}\` |"
+            echo "| CloudFront ID | \`${{ needs.terraform-apply.outputs.cloudfront_id }}\` |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 4 · HEALTH CHECK                                                    │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  health-check:
+    name: "4 · Health Check"
+    runs-on: ubuntu-latest
+    needs: [force-ecs-redeploy, deploy-frontend]
+    if: ${{ always() && !failure() }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Check ALB target group health"
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --query "TargetGroups[?contains(TargetGroupName, 'regula-ecs-lab-dev')].TargetGroupArn | [0]" \
+            --output text)
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            echo "WARNING: Target group not found — skipping ALB health check."
+            exit 0
+          fi
+
+          echo "Target group: ${TG_ARN}"
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TG_ARN" \
+            --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason}' \
+            --output table
+
+          UNHEALTHY=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TG_ARN" \
+            --query 'length(TargetHealthDescriptions[?TargetHealth.State!=`healthy`])' \
+            --output text)
+
+          if [ "$UNHEALTHY" -gt "0" ]; then
+            echo "WARNING: ${UNHEALTHY} target(s) not yet healthy."
+          else
+            echo "All ALB targets are healthy."
+          fi
+
+      - name: "Final ECS service status"
+        run: |
+          aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \
+            --output yaml
+
+      - name: "Write health summary"
+        if: always()
+        run: echo "## 4 · Health Check — ✅ Complete" >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 5 · DEPLOYMENT SUMMARY — always runs, even on failure              │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  deployment-summary:
+    name: "5 · Deployment Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - terraform-apply
+      - force-ecs-redeploy
+      - deploy-frontend
+      - health-check
+    if: always()
+
+    steps:
+      - name: "Print deployment summary"
+        env:
+          R_APPLY:    ${{ needs.terraform-apply.result }}
+          R_ECS:      ${{ needs.force-ecs-redeploy.result }}
+          R_FRONTEND: ${{ needs.deploy-frontend.result }}
+          R_HEALTH:   ${{ needs.health-check.result }}
+        run: |
+          echo "============================================================"
+          echo "  DEPLOYMENT SUMMARY"
+          echo "============================================================"
+          echo "  Commit:      ${{ github.sha }}"
+          echo "  Actor:       ${{ github.actor }}"
+          echo "  Plan Run ID: ${{ inputs.plan_run_id }}"
+          echo ""
+          echo "  1 · Terraform apply  : ${R_APPLY}"
+          echo "  2 · ECS deploy       : ${R_ECS}"
+          echo "  3 · Frontend deploy  : ${R_FRONTEND}"
+          echo "  4 · Health check     : ${R_HEALTH}"
+          echo ""
+          if [[ "$R_APPLY" == "success" && "$R_FRONTEND" == "success" ]]; then
+            echo "  RESULT: DEPLOYMENT SUCCESSFUL"
+          else
+            echo "  RESULT: DEPLOYMENT HAD FAILURES — check failed jobs above"
+          fi
+          echo "============================================================"
+
+      - name: "Write final summary to GitHub UI"
+        if: always()
+        env:
+          R_APPLY:    ${{ needs.terraform-apply.result }}
+          R_ECS:      ${{ needs.force-ecs-redeploy.result }}
+          R_FRONTEND: ${{ needs.deploy-frontend.result }}
+          R_HEALTH:   ${{ needs.health-check.result }}
+        run: |
+          {
+            echo "## 5 · Deployment Summary"
+            echo ""
+            echo "| Step | Result |"
+            echo "|------|--------|"
+            echo "| 1 · Terraform apply | ${R_APPLY} |"
+            echo "| 2 · ECS deploy      | ${R_ECS} |"
+            echo "| 3 · Frontend deploy | ${R_FRONTEND} |"
+            echo "| 4 · Health check    | ${R_HEALTH} |"
+            echo ""
+            echo "**Plan Run ID:** \`${{ inputs.plan_run_id }}\`  ·  **By:** ${{ github.actor }}"
+          } >> $GITHUB_STEP_SUMMARY

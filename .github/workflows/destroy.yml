@@ -1,0 +1,445 @@
+# =============================================================================
+# DESTROY WORKFLOW — Safe Teardown of All AWS Infrastructure
+# =============================================================================
+#
+# WHAT THIS DOES:
+#   Runs 'terraform destroy' to delete every AWS resource this project created:
+#   VPC, subnets, ECS cluster, RDS database, ALB, S3 buckets, CloudFront,
+#   IAM roles, security groups, Route53 records, ACM certificates, etc.
+#
+# ⚠️  THIS IS IRREVERSIBLE. The RDS database will be deleted.
+#     Data is lost unless you take a manual snapshot first.
+#     S3 bucket contents are deleted. ECS tasks are stopped.
+#
+# SAFETY LAYERS (you must pass ALL of these):
+#   1. workflow_dispatch only — can NEVER be triggered by a push or schedule
+#   2. You must type "DESTROY" exactly in the confirmation input
+#   3. Job 2 shows a full plan of everything that will be deleted
+#   4. Job 3 requires a human to click "Approve" in the GitHub UI
+#      (requires "destroy-approval" environment with required reviewers)
+#
+# HOW TO READ THIS FILE:
+#   '#'                  = comment, GitHub ignores this line
+#   ${{ ... }}           = GitHub Actions expression syntax
+#   workflow_dispatch    = manual trigger only (no auto-trigger)
+#   inputs.confirmation  = the text you must type before running
+#   environment:         = links to a GitHub Environment with required reviewers
+#
+# REQUIRED ONE-TIME SETUP:
+#   Settings → Environments → New environment → name: "destroy-approval"
+#   → Required reviewers → add yourself → Save
+#   This is a SEPARATE environment from "production" (for deploy) so you can
+#   have different reviewers or stricter rules for destructive actions.
+# =============================================================================
+
+name: "Destroy"
+
+# =============================================================================
+# TRIGGER — Manual only, with a required confirmation input.
+#
+# This workflow can ONLY be run manually from the GitHub Actions UI.
+# There is no push trigger, no schedule, no way to run it accidentally.
+#
+# When you click "Run workflow", GitHub shows input fields.
+# You must type the word DESTROY (all caps) in the confirmation field.
+# If you type anything else, Job 1 fails and nothing is destroyed.
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: >
+          Type DESTROY (all caps) to confirm you want to delete all AWS
+          infrastructure. This is irreversible. The database will be deleted.
+        required: true
+        type: string
+
+      reason:
+        description: "Why are you destroying? (for audit log)"
+        required: true
+        type: string
+
+# =============================================================================
+# NO CONCURRENCY BLOCK HERE — we never want to cancel a destroy in progress.
+# If a destroy is running, let it finish. Starting a second destroy on top
+# of an in-progress one would leave resources in an inconsistent state.
+# =============================================================================
+
+env:
+  AWS_REGION: us-west-2
+  TF_DIR:     terraform/environments/dev
+
+jobs:
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 1 · VALIDATE CONFIRMATION INPUT                                     │
+  # │                                                                         │
+  # │ Checks that you typed exactly "DESTROY" in the input field.             │
+  # │ If you made a typo or clicked Run workflow by accident, this fails      │
+  # │ immediately and nothing in AWS is touched.                              │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  validate-confirmation:
+    name: "1 · Validate Confirmation"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Check confirmation input"
+        run: |
+          echo "Confirmation input received: '${{ github.event.inputs.confirmation }}'"
+          echo "Reason provided:             '${{ github.event.inputs.reason }}'"
+          echo "Triggered by:                ${{ github.actor }}"
+          echo ""
+
+          # Exact string match required — any other value fails immediately.
+          if [ "${{ github.event.inputs.confirmation }}" != "DESTROY" ]; then
+            echo "ERROR: Confirmation input must be exactly 'DESTROY' (all caps)."
+            echo "       You typed: '${{ github.event.inputs.confirmation }}'"
+            echo ""
+            echo "Nothing has been destroyed. Run the workflow again and type DESTROY."
+            exit 1
+          fi
+
+          echo "Confirmation accepted. Proceeding to plan-destroy."
+
+      - name: "Write confirmation summary"
+        run: |
+          {
+            echo "## 1 · Confirmation"
+            echo "✅ Confirmation accepted"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Triggered by | ${{ github.actor }} |"
+            echo "| Reason | ${{ github.event.inputs.reason }} |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 2 · PLAN DESTROY                                                    │
+  # │                                                                         │
+  # │ Runs 'terraform plan -destroy' to show EXACTLY what will be deleted.   │
+  # │ No resources are deleted in this job — it is read-only.                 │
+  # │                                                                         │
+  # │ WHY PLAN BEFORE DESTROY:                                                │
+  # │   terraform destroy without a plan applies destruction immediately.    │
+  # │   By planning first, you see the full list of resources that will       │
+  # │   disappear. This is your last chance to catch mistakes like:          │
+  # │     - Wrong environment selected                                        │
+  # │     - Resources you didn't expect Terraform to manage                   │
+  # │     - Missing dependencies (e.g., destroy fails if S3 not empty)       │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  plan-destroy:
+    name: "2 · Plan Destroy"
+    runs-on: ubuntu-latest
+    needs: [validate-confirmation]
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Install Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.14"
+          terraform_wrapper: false
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "Initializing Terraform..."
+          terraform init -input=false
+          echo "Init complete."
+
+      # Show current state — what resources exist right now.
+      # This gives you a quick count before seeing the full plan.
+      - name: "Show current Terraform state"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "Resources currently managed by Terraform:"
+          terraform state list
+          echo ""
+          RESOURCE_COUNT=$(terraform state list | wc -l)
+          echo "Total: ${RESOURCE_COUNT} resources will be destroyed."
+
+      # Run 'terraform plan -destroy' to compute the destruction plan.
+      # -destroy: generate a plan to delete ALL managed resources
+      # -out:     save the plan to a binary file for the apply job
+      # This is identical to the deploy plan step but in reverse.
+      - name: "Terraform plan -destroy"
+        id: plan_destroy
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          echo "Computing destroy plan..."
+          echo "⚠️  The following resources will be PERMANENTLY DELETED from AWS."
+          echo ""
+          terraform plan \
+            -destroy \
+            -input=false \
+            -out=tfplan-destroy \
+            2>&1
+          echo ""
+          echo "Plan complete. Review the output above before approving."
+
+      # Show the plan in a readable diff format.
+      - name: "Show destroy plan (human-readable)"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "========================================================"
+          echo "  TERRAFORM DESTROY PLAN — resources that will be deleted"
+          echo "========================================================"
+          terraform show -no-color tfplan-destroy
+          echo "========================================================"
+
+      # Write the full destroy plan to the GitHub Actions job summary.
+      # The approver should open this summary before clicking Approve.
+      - name: "Post destroy plan to GitHub summary"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          {
+            echo "## 2 · Destroy Plan"
+            echo ""
+            echo "⚠️ **The following AWS resources will be permanently deleted.**"
+            echo ""
+            echo "**Triggered by:** ${{ github.actor }}"
+            echo "**Reason:** ${{ github.event.inputs.reason }}"
+            echo ""
+            echo "<details><summary>Click to expand full destroy plan</summary>"
+            echo ""
+            echo '```'
+            terraform show -no-color tfplan-destroy
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> $GITHUB_STEP_SUMMARY
+
+      # Upload the destroy plan as an artifact.
+      # The execute-destroy job downloads and applies this exact file.
+      - name: "Upload destroy plan artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-destroy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}/tfplan-destroy
+          retention-days: 1   # Destroy plans expire fast — don't approve a stale one
+          if-no-files-found: error
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 3 · MANUAL APPROVAL                                                 │
+  # │                                                                         │
+  # │ A human must read the destroy plan from Job 2 and click Approve.        │
+  # │                                                                         │
+  # │ SETUP (one-time):                                                       │
+  # │   Settings → Environments → New environment → name: "destroy-approval"  │
+  # │   → Required reviewers → add yourself → Save                           │
+  # │                                                                         │
+  # │ Use a SEPARATE environment from "production" (deploy approval).        │
+  # │ This lets you add extra reviewers or a longer approval window           │
+  # │ for destructive operations.                                             │
+  # │                                                                         │
+  # │ If this environment doesn't exist, this job passes automatically.       │
+  # │ CREATE THE ENVIRONMENT — do not skip this for a destroy workflow.       │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  manual-approval:
+    name: "3 · Approve Destruction"
+    runs-on: ubuntu-latest
+    needs: [plan-destroy]
+
+    environment: destroy-approval   # SEPARATE environment from the deploy workflow
+
+    steps:
+      - name: "Destruction approved"
+        run: |
+          echo "⚠️  Destruction approved."
+          echo "    Approved by: ${{ github.actor }}"
+          echo "    Commit:      ${{ github.sha }}"
+          echo "    Reason:      ${{ github.event.inputs.reason }}"
+          echo ""
+          echo "Proceeding to destroy all AWS infrastructure..."
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 4 · EXECUTE DESTROY                                                 │
+  # │                                                                         │
+  # │ Applies the saved destroy plan — deletes all AWS infrastructure.        │
+  # │                                                                         │
+  # │ Applies the binary plan file from Job 2. This guarantees exactly the   │
+  # │ same resources shown in the plan are deleted — no more, no less.        │
+  # │                                                                         │
+  # │ ⚠️  KNOWN LIMITATIONS:                                                  │
+  # │   - S3 buckets with objects: Terraform can only delete empty buckets.   │
+  # │     The storage module should have force_destroy = true set, which     │
+  # │     tells Terraform to empty the bucket before deleting it.            │
+  # │   - RDS: skip_final_snapshot = true in tfvars, so no snapshot is taken. │
+  # │     If you want a backup, take a manual RDS snapshot BEFORE running    │
+  # │     this workflow.                                                      │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  execute-destroy:
+    name: "4 · Execute Destroy"
+    runs-on: ubuntu-latest
+    needs: [manual-approval]
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Install Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.14"
+          terraform_wrapper: false
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      # Download the saved destroy plan from Job 2.
+      - name: "Download destroy plan artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-destroy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}
+
+      # Apply the destroy plan.
+      # 'terraform apply tfplan-destroy' applies the pre-computed destruction.
+      # This is identical to the deploy apply but deletes instead of creates.
+      #
+      # Expected duration: 10-20 minutes. RDS deletion is the slowest step
+      # (AWS takes 5-10 minutes to terminate an RDS instance even with
+      # skip_final_snapshot = true).
+      - name: "Execute terraform destroy"
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          echo "⚠️  DESTROYING ALL AWS INFRASTRUCTURE"
+          echo "    This is irreversible."
+          echo "    Triggered by: ${{ github.actor }}"
+          echo "    Reason:       ${{ github.event.inputs.reason }}"
+          echo ""
+          echo "Starting destroy... (RDS deletion may take 10+ minutes)"
+          echo ""
+          terraform apply -input=false tfplan-destroy
+          echo ""
+          echo "Terraform destroy complete."
+
+      - name: "Write destroy summary"
+        if: always()
+        run: |
+          {
+            echo "## 4 · Destroy"
+            echo ""
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "✅ All AWS infrastructure destroyed successfully."
+            else
+              echo "❌ Destroy job failed or was cancelled."
+              echo "Some resources may still exist — check the AWS console."
+            fi
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Triggered by | ${{ github.actor }} |"
+            echo "| Reason | ${{ github.event.inputs.reason }} |"
+            echo "| Status | ${{ job.status }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 5 · VERIFY CLEANUP                                                  │
+  # │                                                                         │
+  # │ Confirms that the key resources are actually gone.                      │
+  # │ Terraform might report success but a resource could be stuck in         │
+  # │ "deleting" state. This job gives you a second opinion from the AWS API. │
+  # │                                                                         │
+  # │ Uses 'continue-on-error: true' on individual checks because some        │
+  # │ checks will error when the resource doesn't exist — that's the expected │
+  # │ outcome. We just want to see the output.                                │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  verify-cleanup:
+    name: "5 · Verify Cleanup"
+    runs-on: ubuntu-latest
+    needs: [execute-destroy]
+    if: always()   # Run even if destroy job failed — always verify state
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # Check if ECS cluster still exists.
+      # Expected result after destroy: empty output or "MISSING" status.
+      - name: "Check ECS cluster"
+        continue-on-error: true
+        run: |
+          echo "Checking ECS cluster..."
+          RESULT=$(aws ecs describe-clusters \
+            --clusters regula-ecs-lab-dev-ecs-cluster \
+            --query 'clusters[0].status' \
+            --output text 2>&1 || echo "NOT_FOUND")
+          echo "ECS cluster status: ${RESULT}"
+          if [ "$RESULT" = "INACTIVE" ] || [ "$RESULT" = "NOT_FOUND" ] || [ "$RESULT" = "None" ]; then
+            echo "ECS cluster: GONE (expected)"
+          else
+            echo "WARNING: ECS cluster may still exist with status: ${RESULT}"
+          fi
+
+      # Check if RDS instance still exists.
+      # Expected: empty output (no instances returned).
+      - name: "Check RDS instance"
+        continue-on-error: true
+        run: |
+          echo "Checking RDS instance..."
+          RESULT=$(aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier, 'regula-ecs-lab-dev')].DBInstanceStatus | [0]" \
+            --output text 2>&1 || echo "NOT_FOUND")
+          echo "RDS status: ${RESULT}"
+          if [ -z "$RESULT" ] || [ "$RESULT" = "None" ] || [ "$RESULT" = "NOT_FOUND" ]; then
+            echo "RDS instance: GONE (expected)"
+          else
+            echo "WARNING: RDS instance may still exist with status: ${RESULT}"
+          fi
+
+      # Check if the VPC still exists.
+      # Expected: empty list.
+      - name: "Check VPC"
+        continue-on-error: true
+        run: |
+          echo "Checking VPC..."
+          VPC_COUNT=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Project,Values=regula-ecs-lab" \
+            --query 'length(Vpcs)' \
+            --output text 2>&1 || echo "ERROR")
+          echo "VPCs with Project=regula-ecs-lab tag: ${VPC_COUNT}"
+          if [ "$VPC_COUNT" = "0" ] || [ -z "$VPC_COUNT" ]; then
+            echo "VPC: GONE (expected)"
+          else
+            echo "WARNING: ${VPC_COUNT} VPC(s) may still exist."
+          fi
+
+      - name: "Write cleanup verification summary"
+        if: always()
+        run: |
+          {
+            echo "## 5 · Cleanup Verification"
+            echo ""
+            echo "Check the step logs above to confirm resources are deleted."
+            echo "Some resources take a few minutes to fully terminate in AWS."
+            echo ""
+            echo "If any resources still exist, you can delete them manually in"
+            echo "the AWS Console or re-run this workflow."
+          } >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,210 @@
+# =============================================================================
+# PLAN WORKFLOW — Preview infrastructure changes, no AWS resources touched.
+# =============================================================================
+#
+# WHAT THIS DOES:
+#   1. validate  — Check Terraform formatting and syntax
+#   2. plan      — Run terraform plan, save artifact, show full diff in summary
+#
+# AFTER THIS RUNS:
+#   Copy the Run ID from this run's URL (the number after /runs/).
+#   Go to Actions → Apply → Run workflow → paste that Run ID.
+#   The Apply workflow will download this exact plan and apply it.
+#
+# WHY TWO WORKFLOWS INSTEAD OF ONE:
+#   GitHub free plan does not support required reviewers on private repos.
+#   Splitting plan/apply gives the same protection: you review the plan
+#   output here, then deliberately trigger Apply only when it looks correct.
+#
+# REQUIRED GITHUB SECRETS (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID     — IAM user access key
+#   AWS_SECRET_ACCESS_KEY — IAM user secret key
+# =============================================================================
+
+name: "Plan"
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why are you running this plan? (for audit log)"
+        required: false
+        default: "Preview infrastructure changes"
+        type: string
+
+# Only one plan at a time — cancel any in-progress plan if a new one starts.
+concurrency:
+  group: terraform-plan
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  TF_DIR:     terraform/environments/dev
+
+jobs:
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 1 · VALIDATE                                                        │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  validate:
+    name: "1 · Validate Terraform"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Install Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.14"
+          terraform_wrapper: false
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: "Check Terraform formatting"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: "Validate Terraform syntax"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      - name: "Write validation summary"
+        if: always()
+        run: |
+          {
+            echo "## 1 · Validate"
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| terraform fmt -check | ✅ Passed |"
+            echo "| terraform validate   | ✅ Passed |"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\` · **By:** ${{ github.actor }}"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 2 · PLAN                                                            │
+  # │                                                                         │
+  # │ Saves the plan as an artifact named tfplan-<run_id>.                   │
+  # │ The Apply workflow downloads it by Run ID — so what you review here    │
+  # │ is exactly what gets deployed, not a freshly computed plan.            │
+  # │                                                                         │
+  # │ IMPORTANT — STALE PLAN:                                                 │
+  # │   If a previous Apply run partially succeeded (e.g. some resources     │
+  # │   were created before an error), the state file changed. Re-run THIS   │
+  # │   workflow to get a fresh plan before triggering Apply again.          │
+  # │   Never re-run Apply with an old plan after a partial apply.           │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  plan:
+    name: "2 · Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: [validate]
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Install Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.14"
+          terraform_wrapper: false
+
+      - name: "Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: "Terraform init"
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: "Terraform plan"
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          set +e
+          terraform plan -input=false -detailed-exitcode -out=tfplan 2>&1
+          TF_EXIT=$?
+          set -e
+
+          if   [ $TF_EXIT -eq 0 ]; then
+            echo "plan_result=no_changes" >> $GITHUB_OUTPUT
+          elif [ $TF_EXIT -eq 1 ]; then
+            echo "plan_result=error" >> $GITHUB_OUTPUT
+            exit 1
+          elif [ $TF_EXIT -eq 2 ]; then
+            echo "plan_result=changes_detected" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "Show plan (human-readable)"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "========================================================"
+          echo "  TERRAFORM PLAN — what will change in AWS"
+          echo "========================================================"
+          terraform show -no-color tfplan
+          echo "========================================================"
+
+      - name: "Post plan to GitHub summary"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          {
+            echo "## 2 · Terraform Plan"
+            echo ""
+            echo "**Result:** \`${{ steps.plan.outputs.plan_result }}\`  ·  **Commit:** \`${{ github.sha }}\`"
+            echo ""
+            echo "<details><summary>Click to expand full plan output</summary>"
+            echo ""
+            echo '```hcl'
+            terraform show -no-color tfplan
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "---"
+            echo "## ▶ To deploy this plan"
+            echo ""
+            echo "1. Review the plan output above"
+            echo "2. Go to **Actions → Apply → Run workflow**"
+            echo "3. Paste this Run ID: \`${{ github.run_id }}\`"
+            echo ""
+            echo "> Plan artifacts expire after 7 days. If expired, re-run this workflow."
+          } >> $GITHUB_STEP_SUMMARY
+
+      # Artifact name includes the run ID so Apply can download the exact plan
+      # that was reviewed — not a plan from a different run.
+      - name: "Upload plan artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 7
+          if-no-files-found: error
+
+      # Print the Run ID prominently in the logs as well, for easy copy-paste.
+      - name: "Print Apply instructions"
+        run: |
+          echo "============================================================"
+          echo "  PLAN COMPLETE"
+          echo "============================================================"
+          echo "  Result:  ${{ steps.plan.outputs.plan_result }}"
+          echo "  Reason:  ${{ github.event.inputs.reason }}"
+          echo ""
+          echo "  To deploy: Actions → Apply → Run workflow"
+          echo "  Plan Run ID to paste: ${{ github.run_id }}"
+          echo "============================================================"

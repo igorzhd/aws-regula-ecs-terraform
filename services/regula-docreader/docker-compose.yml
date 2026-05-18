@@ -1,0 +1,7 @@
+services:
+  regula:
+    image: regulaforensics/docreader:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./regula.license:/app/extBin/unix/regula.license

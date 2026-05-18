@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document Verification</title>
+  <link rel="stylesheet" href="styles.css?v=11">
+  <script src="config.js?v=11"></script>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────── -->
+<header class="header">
+  <div class="header-inner">
+    <a href="#process" class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <polyline points="9 12 11 14 15 10"/>
+      </svg>
+      DocVerify
+    </a>
+    <nav class="nav">
+      <a href="#process" class="nav-link" data-view="process">Process</a>
+      <a href="#history" class="nav-link" data-view="history">History</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ── Main ────────────────────────────────────────────────── -->
+<main class="main">
+  <div class="container">
+
+    <!-- ── Process view ──────────────────────────────────── -->
+    <section id="view-process" class="view">
+
+      <!-- Upload panel -->
+      <div id="upload-panel">
+        <div class="page-title">Verify a Document</div>
+        <div class="page-sub">Upload a passport, ID card, or driver's license for verification</div>
+
+        <div class="upload-grid">
+
+          <!-- Front image -->
+          <div class="upload-zone" id="zone-front">
+            <input type="file" id="input-front" accept="image/*">
+            <div class="upload-placeholder">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="4" width="18" height="16" rx="2"/>
+                <circle cx="8.5" cy="9.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+              </svg>
+              <p>Front of document</p>
+              <div class="upload-hint">Click or drag & drop</div>
+              <div class="upload-badge badge-required">REQUIRED</div>
+            </div>
+            <div class="upload-preview hidden">
+              <img id="preview-front" alt="Front preview">
+              <span class="upload-label">Front</span>
+            </div>
+          </div>
+
+          <!-- Back image -->
+          <div class="upload-zone" id="zone-back">
+            <input type="file" id="input-back" accept="image/*">
+            <div class="upload-placeholder">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="4" width="18" height="16" rx="2"/>
+                <line x1="7" y1="9" x2="17" y2="9"/>
+                <line x1="7" y1="13" x2="13" y2="13"/>
+              </svg>
+              <p>Back of document</p>
+              <div class="upload-hint">For two-sided IDs and licenses</div>
+              <div class="upload-badge badge-optional">OPTIONAL</div>
+            </div>
+            <div class="upload-preview hidden">
+              <img id="preview-back" alt="Back preview">
+              <span class="upload-label">Back</span>
+            </div>
+          </div>
+
+        </div>
+
+        <button id="process-btn" class="btn btn-primary btn-lg" disabled>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          Process Document
+        </button>
+
+        <div id="process-error" class="error-banner hidden"></div>
+      </div>
+
+      <!-- Spinner (shown during processing) -->
+      <div id="process-spinner" class="hidden">
+        <div class="divider"></div>
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
+          <span>Processing document…</span>
+        </div>
+      </div>
+
+      <!-- Results (shown after processing) -->
+      <div id="results" class="hidden">
+        <div class="divider"></div>
+      </div>
+
+    </section>
+
+    <!-- ── History view ───────────────────────────────────── -->
+    <section id="view-history" class="view">
+      <div id="history-content"></div>
+    </section>
+
+    <!-- ── Detail view ────────────────────────────────────── -->
+    <section id="view-detail" class="view">
+      <div id="detail-results"></div>
+    </section>
+
+  </div>
+</main>
+
+<script src="app.js?v=11"></script>
+</body>
+</html>

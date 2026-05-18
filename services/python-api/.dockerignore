@@ -1,0 +1,55 @@
+# ============================================================
+# .dockerignore — Files to exclude from Docker build context
+#
+# When Docker builds an image, it sends all files in the
+# current directory to the Docker daemon (the "build context").
+# This file tells Docker which files to EXCLUDE from that.
+#
+# WHY THIS MATTERS:
+#   - Smaller build context = faster builds
+#   - Prevents secrets (.env files) from being baked into
+#     the image accidentally
+#   - Prevents local development artifacts from polluting
+#     the container
+# ============================================================
+
+# Environment files — never include real secrets in an image
+.env
+*.env
+!.env.example
+
+# Python cache files — regenerated automatically inside container
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Local storage — development files, not part of the app
+local_storage/
+
+# Version control
+.git/
+.gitignore
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test files — not needed in production image
+tests/
+test_*.py
+*_test.py
+pytest.ini
+.pytest_cache/
+
+# Documentation
+*.md
+docs/
+
+# Alembic migration versions are needed — do NOT exclude alembic/
